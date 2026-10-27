@@ -3,32 +3,18 @@
 netcheck.py - quick network connectivity check.
 
 Runs:
-  1. Ping 8.8.8.8 (4 packets) and parses loss / round-trip statistics
-  2. DNS lookups for a few hostnames (timed)
-  3. Timed download of a small web page
+  1. Network info: interface, local IP, default gateway, DNS servers
+  2. Ping the default gateway (4 packets) with loss / round-trip statistics
+  3. Ping 8.8.8.8 (4 packets) with the same statistics
+  4. DNS lookups for a few hostnames (timed)
+  5. Timed download of a small web page
 
 Each run appends ONE row to <hostname>.csv, located next to the executable
 (or next to this script when run with plain Python). The header row is
-written only when the file is created.
+written only when the file is created. The full ipconfig /all (Windows) or
+ifconfig -a (Mac) output is appended to <hostname>_netinfo.txt.
 
 Works on Windows, macOS and Linux using only the standard library.
-
-Build Mac (Apple and Intel) and Windows on GitHub
-
-Mac installation steps
-    pyinstaller --onefile --name netcheck netcheck.py
-
-    time ./netcheck
-
-    mkdir ~/netcheck
-    cp netcheck ~/netcheck
-    cp netcheck.plist ~/netcheck
-    vi ~/netcheck/netcheck.plist
-    cp netcheck.plist ~/Library/LaunchAgents
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/netcheck.plist
-    launchctl list | grep netcheck
-    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/netcheck.plist
-    launchctl list | grep netcheck
 """
 
 import csv
@@ -48,6 +34,7 @@ PING_COUNT = 4
 DNS_NAMES = ["google.com", "cloudflare.com", "example.com"]
 DOWNLOAD_URL = "https://example.com/"
 TIMEOUT = 10  # seconds for DNS/HTTP
+SAVE_RAW_NETINFO = False  # also append full ipconfig/ifconfig output to <hostname>_netinfo.txt
 
 
 def output_dir():
@@ -105,6 +92,129 @@ def run_ping(target, count):
     if "sent" not in stats:
         stats["error"] = "could not parse ping output"
     return stats
+
+
+def run_cmd(cmd, timeout=15):
+    """Run a command and return its combined output ('' on any failure)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+        return (p.stdout or "") + (p.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+IPV4 = r"\d{1,3}(?:\.\d{1,3}){3}"
+
+
+def _unique(items):
+    seen, out = set(), []
+    for i in items:
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def get_network_info():
+    """Return (info_dict, raw_text).
+
+    info keys: interface, local_ip, gateway, dns (list). Any value that
+    couldn't be determined is left blank. raw_text is the full output of
+    ipconfig /all (Windows) or ifconfig -a / ip addr (Mac/Linux).
+    """
+    system = platform.system()
+    info = {"interface": "", "local_ip": "", "gateway": "", "dns": []}
+    raw = ""
+
+    if system == "Windows":
+        raw = run_cmd(["ipconfig", "/all"])
+        # Default route with the lowest metric (numeric, so not locale-dependent)
+        best = None
+        for line in run_cmd(["route", "print", "-4", "0.0.0.0"]).splitlines():
+            m = re.match(rf"\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\S+)\s+({IPV4})\s+(\d+)", line)
+            if m and re.fullmatch(IPV4, m[1]) and (best is None or int(m[3]) < best[2]):
+                best = (m[1], m[2], int(m[3]))
+        if best:
+            info["gateway"], info["local_ip"] = best[0], best[1]
+
+        # Find the adapter block that owns the local IP, then read its DNS servers
+        header, block = "", []
+        blocks = []
+        for line in raw.splitlines():
+            if line and not line[0].isspace() and line.rstrip().endswith(":"):
+                if header:
+                    blocks.append((header, block))
+                header, block = line.strip().rstrip(":"), []
+            else:
+                block.append(line)
+        if header:
+            blocks.append((header, block))
+        for header, block in blocks:
+            if info["local_ip"] and re.search(rf"\b{re.escape(info['local_ip'])}\b",
+                                              "\n".join(block)):
+                info["interface"] = header
+                collecting = False
+                for line in block:
+                    if "DNS Servers" in line:  # English Windows; blank otherwise
+                        collecting = True
+                        info["dns"] += re.findall(IPV4, line)
+                    elif collecting and re.fullmatch(rf"\s+{IPV4}\s*", line):
+                        info["dns"] += re.findall(IPV4, line)
+                    else:
+                        collecting = False
+                break
+
+    elif system == "Darwin":
+        raw = run_cmd(["ifconfig", "-a"])
+        route = run_cmd(["route", "-n", "get", "default"])
+        m = re.search(r"gateway:\s*(\S+)", route)
+        info["gateway"] = m[1] if m else ""
+        m = re.search(r"interface:\s*(\S+)", route)
+        info["interface"] = m[1] if m else ""
+        if info["interface"]:
+            info["local_ip"] = run_cmd(["ipconfig", "getifaddr", info["interface"]]).strip()
+        info["dns"] = re.findall(rf"nameserver\[\d+\]\s*:\s*(\S+)",
+                                 run_cmd(["scutil", "--dns"]))
+
+    else:  # Linux and others
+        raw = run_cmd(["ip", "addr"]) or run_cmd(["ifconfig", "-a"])
+        m = re.search(r"default via (\S+) dev (\S+)",
+                      run_cmd(["ip", "route", "show", "default"]))
+        if m:
+            info["gateway"], info["interface"] = m[1], m[2]
+            m = re.search(rf"inet ({IPV4})",
+                          run_cmd(["ip", "-4", "-o", "addr", "show", info["interface"]]))
+            info["local_ip"] = m[1] if m else ""
+        try:
+            with open("/etc/resolv.conf", encoding="utf-8") as f:
+                info["dns"] = re.findall(r"^nameserver\s+(\S+)", f.read(), re.M)
+        except OSError:
+            pass
+
+    if not re.fullmatch(IPV4, info["gateway"]):
+        info["gateway"] = ""  # e.g. "link#14" on some VPN setups
+    info["dns"] = _unique(info["dns"])
+    return info, raw
+
+
+def ping_columns(prefix, target, p):
+    """CSV columns for one ping test. Returns (columns, passed)."""
+    ok = p.get("received", 0) > 0
+    cols = [
+        (f"{prefix}_target", target),
+        (f"{prefix}_packets_sent", fmt(p.get("sent"))),
+        (f"{prefix}_packets_received", fmt(p.get("received"))),
+        (f"{prefix}_packets_lost", fmt(p.get("lost"))),
+        (f"{prefix}_loss_pct", fmt(p.get("loss_pct"))),
+        (f"{prefix}_rtt_min_ms", fmt(p.get("rtt_min"))),
+        (f"{prefix}_rtt_avg_ms", fmt(p.get("rtt_avg"))),
+        (f"{prefix}_rtt_max_ms", fmt(p.get("rtt_max"))),
+        (f"{prefix}_rtt_stddev_ms", fmt(p.get("rtt_stddev"))),
+        (f"{prefix}_result", "PASS" if ok else "FAIL"),
+        (f"{prefix}_error", p.get("error", "")),
+    ]
+    return cols, ok
 
 
 def check_dns(names):
@@ -189,22 +299,27 @@ def run_checks(hostname, now):
         ("os", f"{platform.system()} {platform.release()}"),
     ]
 
-    # --- Ping ---
-    p = run_ping(PING_TARGET, PING_COUNT)
-    ping_ok = p.get("received", 0) > 0
+    # --- Network info ---
+    net, raw_netinfo = get_network_info()
     row += [
-        ("ping_target", PING_TARGET),
-        ("ping_packets_sent", fmt(p.get("sent"))),
-        ("ping_packets_received", fmt(p.get("received"))),
-        ("ping_packets_lost", fmt(p.get("lost"))),
-        ("ping_loss_pct", fmt(p.get("loss_pct"))),
-        ("ping_rtt_min_ms", fmt(p.get("rtt_min"))),
-        ("ping_rtt_avg_ms", fmt(p.get("rtt_avg"))),
-        ("ping_rtt_max_ms", fmt(p.get("rtt_max"))),
-        ("ping_rtt_stddev_ms", fmt(p.get("rtt_stddev"))),
-        ("ping_result", "PASS" if ping_ok else "FAIL"),
-        ("ping_error", p.get("error", "")),
+        ("net_interface", net["interface"]),
+        ("net_local_ip", net["local_ip"]),
+        ("net_gateway", net["gateway"]),
+        ("net_dns_servers", " ".join(net["dns"])),
     ]
+
+    # --- Ping default gateway ---
+    if net["gateway"]:
+        gp = run_ping(net["gateway"], PING_COUNT)
+    else:
+        gp = {"error": "no default gateway found"}
+    cols, _ = ping_columns("gw_ping", net["gateway"], gp)
+    row += cols
+
+    # --- Ping internet target ---
+    p = run_ping(PING_TARGET, PING_COUNT)
+    cols, ping_ok = ping_columns("ping", PING_TARGET, p)
+    row += cols
 
     # --- DNS ---
     dns = check_dns(DNS_NAMES)
@@ -236,7 +351,17 @@ def run_checks(hostname, now):
 
     row.append(("overall_result",
                 "PASS" if (ping_ok and dns_ok and d["ok"]) else "FAIL"))
-    return row
+    return row, raw_netinfo
+
+
+def append_raw_netinfo(path, now, raw):
+    """Append the full ipconfig/ifconfig output, with a timestamp header."""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"===== {now.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(raw.strip() + "\n\n")
+    except OSError:
+        pass  # the CSV is the important output
 
 
 def append_csv(path, row):
@@ -270,7 +395,10 @@ def main():
     path = os.path.join(output_dir(), f"{hostname}.csv")
 
     print("Running network checks, please wait...")
-    row = run_checks(hostname, now)
+    row, raw_netinfo = run_checks(hostname, now)
+    if SAVE_RAW_NETINFO and raw_netinfo.strip():
+        append_raw_netinfo(
+            os.path.join(output_dir(), f"{hostname}_netinfo.txt"), now, raw_netinfo)
 
     try:
         append_csv(path, row)
@@ -290,13 +418,21 @@ def main():
 
     # Console summary
     data = dict(row)
-    print(f"\nPing {PING_TARGET}: {data['ping_result']}  "
+    print(f"\nInterface:      {data['net_interface'] or '?'}  "
+          f"IP {data['net_local_ip'] or '?'}  DNS {data['net_dns_servers'] or '?'}")
+    print(f"Gateway {data['net_gateway'] or '?'}: {data['gw_ping_result']}  "
+          f"loss={data['gw_ping_loss_pct']}%  avg={data['gw_ping_rtt_avg_ms']} ms")
+    print(f"Ping {PING_TARGET}: {data['ping_result']}  "
           f"loss={data['ping_loss_pct']}%  avg={data['ping_rtt_avg_ms']} ms")
     print(f"DNS:            {data['dns_result']}")
     print(f"HTTP download:  {data['http_result']}  "
           f"{data['http_total_ms']} ms")
     print(f"Overall:        {data['overall_result']}")
     print(f"\nResult appended to: {path}")
+
+    # Keep the window open when launched by double-click as an executable
+    if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+        input("\nPress Enter to close...")
 
 
 if __name__ == "__main__":
