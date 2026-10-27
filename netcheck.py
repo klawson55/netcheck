@@ -13,6 +13,8 @@ written only when the file is created.
 
 Works on Windows, macOS and Linux using only the standard library.
 
+Build Mac (Apple and Intel) and Windows on GitHub
+
 Mac installation steps
     pyinstaller --onefile --name netcheck netcheck.py
 
