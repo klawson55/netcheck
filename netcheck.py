@@ -15,6 +15,24 @@ written only when the file is created. The full ipconfig /all (Windows) or
 ifconfig -a (Mac) output is appended to <hostname>_netinfo.txt.
 
 Works on Windows, macOS and Linux using only the standard library.
+
+Build Mac (Apple and Intel) and Windows on GitHub
+
+Mac installation steps
+    pyinstaller --onefile --name netcheck netcheck.py
+
+    time ./netcheck
+
+    mkdir ~/netcheck
+    cp netcheck ~/netcheck
+    cp netcheck.plist ~/netcheck
+    vi ~/netcheck/netcheck.plist
+    cp netcheck.plist ~/Library/LaunchAgents
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/netcheck.plist
+    launchctl list | grep netcheck
+    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/netcheck.plist
+    launchctl list | grep netcheck
+
 """
 
 import csv
@@ -429,10 +447,6 @@ def main():
           f"{data['http_total_ms']} ms")
     print(f"Overall:        {data['overall_result']}")
     print(f"\nResult appended to: {path}")
-
-    # Keep the window open when launched by double-click as an executable
-    if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
-        input("\nPress Enter to close...")
 
 
 if __name__ == "__main__":
