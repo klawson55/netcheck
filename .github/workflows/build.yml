@@ -1,0 +1,64 @@
+name: Build netcheck
+
+on:
+  workflow_dispatch:        # "Run workflow" button in the Actions tab
+  push:
+    branches: [main]
+    paths: [netcheck.py, .github/workflows/build.yml]
+    tags: ["v*"]            # tagging v1.0 etc. also publishes a Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: netcheck-windows
+            file: dist/netcheck.exe
+          - os: macos-latest          # Apple Silicon (arm64)
+            artifact: netcheck-macos-arm64
+            file: dist/netcheck-macos-arm64.tar.gz
+          - os: macos-15-intel        # Intel (x86_64)
+            artifact: netcheck-macos-intel
+            file: dist/netcheck-macos-intel.tar.gz
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller certifi
+
+      - name: Build executable
+        run: pyinstaller --onefile --name netcheck netcheck.py
+
+      # tar keeps the executable bit, which upload-artifact would otherwise drop
+      - name: Package macOS binary
+        if: runner.os == 'macOS'
+        run: tar -czf ${{ matrix.file }} -C dist netcheck
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.file }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
