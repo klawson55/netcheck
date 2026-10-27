@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>netcheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/home/netcheck/netcheck</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/home/netcheck</string>
+
+    <!-- Run every 300 seconds (5 minutes), and once right when loaded -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- launchd's default PATH lacks /sbin, where ping lives -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/sbin:/usr/sbin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Only used for troubleshooting; results go to the CSV -->
+    <key>StandardOutPath</key>
+    <string>/Users/home/netcheck/netcheck.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/home/netcheck/netcheck.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
