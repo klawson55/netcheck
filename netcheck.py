@@ -3,11 +3,13 @@
 netcheck.py - quick network connectivity check.
 
 Runs:
+  0. System load: CPU %, load average, memory use
   1. Network info: interface, local IP, default gateway, DNS servers
-  2. Ping the default gateway (4 packets) with loss / round-trip statistics
-  3. Ping 8.8.8.8 (4 packets) with the same statistics
-  4. DNS lookups for a few hostnames (timed)
-  5. Timed download of a small web page
+  2. Wi-Fi info: SSID, BSSID, MAC, IP, channel, signal strength, link speed
+  3. Ping the default gateway (4 packets) with loss / round-trip statistics
+  4. Ping 8.8.8.8 (4 packets) with the same statistics
+  5. DNS lookups for a few hostnames (timed)
+  6. Timed download of a small web page
 
 Each run appends ONE row to <hostname>.csv, located next to the executable
 (or next to this script when run with plain Python). The header row is
@@ -15,8 +17,6 @@ written only when the file is created. The full ipconfig /all (Windows) or
 ifconfig -a (Mac) output is appended to <hostname>_netinfo.txt.
 
 Works on Windows, macOS and Linux using only the standard library.
-
-Build Mac (Apple and Intel) and Windows on GitHub
 
 Mac installation steps
     pyinstaller --onefile --name netcheck netcheck.py
@@ -27,12 +27,11 @@ Mac installation steps
     cp netcheck ~/netcheck
     cp netcheck.plist ~/netcheck
     vi ~/netcheck/netcheck.plist
-    cp netcheck.plist ~/Library/LaunchAgents
+    cp ~/netcheck/netcheck.plist ~/Library/LaunchAgents
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/netcheck.plist
     launchctl list | grep netcheck
     launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/netcheck.plist
     launchctl list | grep netcheck
-
 """
 
 import csv
@@ -52,7 +51,7 @@ PING_COUNT = 4
 DNS_NAMES = ["google.com", "cloudflare.com", "example.com"]
 DOWNLOAD_URL = "https://example.com/"
 TIMEOUT = 10  # seconds for DNS/HTTP
-SAVE_RAW_NETINFO = False  # also append full ipconfig/ifconfig output to <hostname>_netinfo.txt
+SAVE_RAW_NETINFO = True  # also append full ipconfig/ifconfig output to <hostname>_netinfo.txt
 
 
 def output_dir():
@@ -216,6 +215,277 @@ def get_network_info():
     return info, raw
 
 
+def _kv_lines(text):
+    """'Key : value' lines -> {lowercased key: value} (first occurrence wins)."""
+    d = {}
+    for line in text.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            d.setdefault(k.strip().lower(), v.strip())
+    return d
+
+
+def _num(text):
+    m = re.search(r"-?\d+(?:\.\d+)?", text or "")
+    if not m:
+        return ""
+    v = float(m[0])
+    return int(v) if v.is_integer() else v
+
+
+def _freq_to_channel(mhz):
+    if 2412 <= mhz <= 2472:
+        return (mhz - 2407) // 5, "2.4GHz"
+    if mhz == 2484:
+        return 14, "2.4GHz"
+    if 5160 <= mhz <= 5885:
+        return (mhz - 5000) // 5, "5GHz"
+    if 5955 <= mhz <= 7115:
+        return (mhz - 5950) // 5, "6GHz"
+    return "", ""
+
+
+WIFI_FIELDS = ["state", "interface", "adapter", "mac", "ip", "ssid", "bssid",
+               "radio_type", "band", "channel", "security", "signal_pct",
+               "rssi_dbm", "noise_dbm", "tx_rate_mbps", "rx_rate_mbps"]
+
+
+def get_wifi_info(net, ipconfig_raw):
+    """Return (info_dict, raw_text) describing the Wi-Fi connection.
+
+    Fields that the OS doesn't expose are left blank. state is one of
+    'connected', 'disconnected' or 'no wifi adapter'.
+    """
+    system = platform.system()
+    info = {k: "" for k in WIFI_FIELDS}
+    raw = ""
+
+    if system == "Windows":
+        raw = run_cmd(["netsh", "wlan", "show", "interfaces"])
+        chunks = ["Name :" + c for c in re.split(r"(?m)^\s*Name\s*:", raw)[1:]]
+        if not chunks:
+            info["state"] = "no wifi adapter"
+        else:
+            chunk = next((c for c in chunks
+                          if re.search(r"State\s*:\s*connected", c, re.I)), chunks[0])
+            d = _kv_lines(chunk)
+            info.update(
+                state="connected" if re.search(r"State\s*:\s*connected", chunk, re.I)
+                else "disconnected",
+                interface=d.get("name", ""), adapter=d.get("description", ""),
+                mac=d.get("physical address", ""), ssid=d.get("ssid", ""),
+                bssid=d.get("bssid", ""), radio_type=d.get("radio type", ""),
+                band=d.get("band", ""), channel=_num(d.get("channel")),
+                security=d.get("authentication", ""),
+                signal_pct=_num(d.get("signal")),
+                tx_rate_mbps=_num(d.get("transmit rate (mbps)")),
+                rx_rate_mbps=_num(d.get("receive rate (mbps)")))
+            # IPv4 address from the matching ipconfig adapter block
+            name = info["interface"]
+            if name:
+                m = re.search(
+                    rf"(?ms)^[^\n]*adapter {re.escape(name)}:\s*\n(.*?)(?=^\S|\Z)",
+                    ipconfig_raw)
+                if m:
+                    ip = re.search(rf"IPv4 Address[ .]*:\s*({IPV4})", m[1])
+                    info["ip"] = ip[1] if ip else ""
+
+    elif system == "Darwin":
+        hp = run_cmd(["networksetup", "-listallhardwareports"])
+        m = re.search(r"Hardware Port: (?:Wi-Fi|AirPort)\s*\nDevice: (\S+)"
+                      r"(?:\s*\nEthernet Address: (\S+))?", hp)
+        if not m:
+            info["state"] = "no wifi adapter"
+        else:
+            dev = m[1]
+            info["interface"] = dev
+            mac = re.search(r"ether (\S+)", run_cmd(["ifconfig", dev]))
+            info["mac"] = mac[1] if mac else (m[2] or "")
+            info["ip"] = run_cmd(["ipconfig", "getifaddr", dev]).strip()
+            # system_profiler is the only source that still works on current macOS
+            lines = run_cmd(["system_profiler", "SPAirPortDataType"],
+                            timeout=45).splitlines()
+            idx = next((i for i, l in enumerate(lines)
+                        if l.strip() == "Current Network Information:"), None)
+            if idx is None or idx + 1 >= len(lines):
+                info["state"] = "disconnected"
+            else:
+                info["state"] = "connected"
+                ssid_line = lines[idx + 1]
+                indent = len(ssid_line) - len(ssid_line.lstrip())
+                info["ssid"] = ssid_line.strip().rstrip(":")
+                section = [ssid_line]
+                for l in lines[idx + 2:]:
+                    if not l.strip() or len(l) - len(l.lstrip()) <= indent:
+                        break
+                    section.append(l)
+                raw = "\n".join(section)
+                d = _kv_lines("\n".join(section[1:]))
+                ch = d.get("channel", "")
+                band = re.search(r"\((\d+(?:\.\d+)?\s*GHz)", ch)
+                sn = re.search(r"(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm",
+                               d.get("signal / noise", ""))
+                info.update(
+                    radio_type=d.get("phy mode", ""), channel=_num(ch),
+                    band=band[1].replace(" ", "") if band else "",
+                    security=d.get("security", ""),
+                    rssi_dbm=int(sn[1]) if sn else "",
+                    noise_dbm=int(sn[2]) if sn else "",
+                    tx_rate_mbps=_num(d.get("transmit rate")))
+            # Fallback 1: 'ipconfig getsummary' (reported to work on macOS 15.7+).
+            # It only includes the SSID in verbose mode, which needs root; the
+            # setting is switched back off straight afterwards.
+            if info["ssid"] in ("", "<redacted>"):
+                is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+                if is_root:
+                    run_cmd(["ipconfig", "setverbose", "1"])
+                try:
+                    summary = run_cmd(["ipconfig", "getsummary", dev])
+                finally:
+                    if is_root:
+                        run_cmd(["ipconfig", "setverbose", "0"])
+                m3 = re.search(r"(?m)^\s*SSID\s*:\s*(\S.*?)\s*$", summary)
+                if m3 and m3[1] != "<redacted>":
+                    info["ssid"] = m3[1]
+                    info["state"] = "connected"
+                m4 = re.search(r"(?m)^\s*BSSID\s*:\s*([0-9a-fA-F:]{11,17})\s*$", summary)
+                if m4 and not info["bssid"]:
+                    info["bssid"] = m4[1]
+
+            # Fallback 2: older macOS versions answer this directly, newer ones
+            # often report "not associated" even when connected.
+            if info["ssid"] in ("", "<redacted>"):
+                out = run_cmd(["networksetup", "-getairportnetwork", dev])
+                m2 = re.search(r"Current (?:Wi-Fi|AirPort) Network:\s*(.+)", out)
+                if m2 and m2[1].strip():
+                    info["ssid"] = m2[1].strip()
+                    info["state"] = "connected"
+
+    else:  # Linux (needs the 'iw' tool)
+        devs = re.findall(r"Interface (\S+)", run_cmd(["iw", "dev"]))
+        if not devs:
+            info["state"] = "no wifi adapter"
+        else:
+            dev = devs[0]
+            info["interface"] = dev
+            try:
+                with open(f"/sys/class/net/{dev}/address", encoding="utf-8") as f:
+                    info["mac"] = f.read().strip()
+            except OSError:
+                pass
+            ip = re.search(rf"inet ({IPV4})",
+                           run_cmd(["ip", "-4", "-o", "addr", "show", dev]))
+            info["ip"] = ip[1] if ip else ""
+            raw = run_cmd(["iw", "dev", dev, "link"])
+            if raw.startswith("Connected"):
+                info["state"] = "connected"
+                g = lambda pat: (re.search(pat, raw) or [None, ""])[1]
+                info["bssid"] = g(r"Connected to (\S+)")
+                info["ssid"] = g(r"SSID: (.*)").strip()
+                freq = g(r"freq: (\d+)")
+                if freq:
+                    info["channel"], info["band"] = _freq_to_channel(int(freq))
+                info["rssi_dbm"] = _num(g(r"signal: (-?\d+)"))
+                info["tx_rate_mbps"] = _num(g(r"tx bitrate: ([\d.]+)"))
+                info["rx_rate_mbps"] = _num(g(r"rx bitrate: ([\d.]+)"))
+            else:
+                info["state"] = "disconnected"
+
+    return info, raw
+
+
+SYS_FIELDS = ["cpu_cores", "cpu_pct", "load_1m", "mem_total_mb",
+              "mem_available_mb", "mem_used_pct"]
+
+
+def get_system_load():
+    """CPU and memory snapshot (standard library only). Blank where unknown.
+
+    cpu_pct is measured over about a second; load_1m is the 1-minute load
+    average (Mac/Linux only); mem_available_mb is memory that can be used
+    without swapping.
+    """
+    info = {k: "" for k in SYS_FIELDS}
+    info["cpu_cores"] = os.cpu_count() or ""
+    try:
+        info["load_1m"] = round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):
+        pass  # not available on Windows
+
+    system = platform.system()
+    total = avail = None
+    try:
+        if system == "Windows":
+            import ctypes
+
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("lo", ctypes.c_uint32), ("hi", ctypes.c_uint32)]
+
+            class MEMSTAT(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_uint32),
+                            ("dwMemoryLoad", ctypes.c_uint32),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+            def sample():
+                i, k, u = FILETIME(), FILETIME(), FILETIME()
+                ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(i), ctypes.byref(k), ctypes.byref(u))
+                return [(f.hi << 32) | f.lo for f in (i, k, u)]
+
+            a = sample()
+            time.sleep(1)
+            b = sample()
+            idle = b[0] - a[0]
+            busy_plus_idle = (b[1] - a[1]) + (b[2] - a[2])  # kernel includes idle
+            if busy_plus_idle > 0:
+                info["cpu_pct"] = 100 * (1 - idle / busy_plus_idle)
+            m = MEMSTAT()
+            m.dwLength = ctypes.sizeof(m)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            total, avail = m.ullTotalPhys, m.ullAvailPhys
+
+        elif system == "Darwin":
+            out = run_cmd(["top", "-l", "2", "-n", "0", "-s", "1"], timeout=20)
+            idle = re.findall(r"CPU usage:.*?([\d.]+)% idle", out)
+            if idle:
+                info["cpu_pct"] = 100 - float(idle[-1])  # second sample is accurate
+            total = int(run_cmd(["sysctl", "-n", "hw.memsize"]).strip())
+            vm = run_cmd(["vm_stat"])
+            page = int(re.search(r"page size of (\d+) bytes", vm)[1])
+            pages = sum(int(re.search(rf"Pages {name}:\s+(\d+)", vm)[1])
+                        for name in ("free", "inactive", "speculative"))
+            avail = pages * page
+
+        else:  # Linux
+            def cpu_times():
+                with open("/proc/stat", encoding="utf-8") as f:
+                    v = [int(x) for x in f.readline().split()[1:9]]
+                return v[3] + v[4], sum(v)  # idle+iowait, total
+
+            i1, t1 = cpu_times()
+            time.sleep(1)
+            i2, t2 = cpu_times()
+            if t2 > t1:
+                info["cpu_pct"] = 100 * (1 - (i2 - i1) / (t2 - t1))
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                mem = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in f if ":" in l}
+            total, avail = mem["MemTotal"], mem["MemAvailable"]
+    except Exception:  # noqa: BLE001 - never let a stats failure stop the run
+        pass
+
+    if total and avail is not None:
+        info["mem_total_mb"] = round(total / 1048576)
+        info["mem_available_mb"] = round(avail / 1048576)
+        info["mem_used_pct"] = 100 * (1 - avail / total)
+    return info
+
+
 def ping_columns(prefix, target, p):
     """CSV columns for one ping test. Returns (columns, passed)."""
     ok = p.get("received", 0) > 0
@@ -317,6 +587,11 @@ def run_checks(hostname, now):
         ("os", f"{platform.system()} {platform.release()}"),
     ]
 
+    # --- System load (CPU / memory) ---
+    sysinfo = get_system_load()
+    for key in SYS_FIELDS:
+        row.append((f"sys_{key}", fmt(sysinfo[key])))
+
     # --- Network info ---
     net, raw_netinfo = get_network_info()
     row += [
@@ -325,6 +600,15 @@ def run_checks(hostname, now):
         ("net_gateway", net["gateway"]),
         ("net_dns_servers", " ".join(net["dns"])),
     ]
+
+    # --- Wi-Fi info ---
+    wifi, raw_wifi = get_wifi_info(net, raw_netinfo)
+    if raw_wifi.strip():
+        raw_netinfo += "\n\n--- Wi-Fi ---\n" + raw_wifi
+    for key in WIFI_FIELDS:
+        row.append((f"wifi_{key}", fmt(wifi[key])))
+    row.append(("wifi_is_default_route",
+                "yes" if wifi["ip"] and wifi["ip"] == net["local_ip"] else "no"))
 
     # --- Ping default gateway ---
     if net["gateway"]:
@@ -438,7 +722,16 @@ def main():
     data = dict(row)
     print(f"\nInterface:      {data['net_interface'] or '?'}  "
           f"IP {data['net_local_ip'] or '?'}  DNS {data['net_dns_servers'] or '?'}")
-    print(f"Gateway {data['net_gateway'] or '?'}: {data['gw_ping_result']}  "
+    cpu = data["sys_cpu_pct"] if data["sys_cpu_pct"] != "" else "?"
+    mem = data["sys_mem_used_pct"] if data["sys_mem_used_pct"] != "" else "?"
+    print(f"System load:    CPU {cpu}%  memory used {mem}%")
+    if data["wifi_state"] == "connected":
+        print(f"Wi-Fi:          {data['wifi_ssid'] or '?'}  "
+              f"BSSID {data['wifi_bssid'] or '?'}  ch {data['wifi_channel'] or '?'}  "
+              f"signal {data['wifi_signal_pct'] or data['wifi_rssi_dbm'] or '?'}")
+    else:
+        print(f"Wi-Fi:          {data['wifi_state']}")
+    print(f"Gateway {data['net_gateway'] or '?'}:  {data['gw_ping_result']}  "
           f"loss={data['gw_ping_loss_pct']}%  avg={data['gw_ping_rtt_avg_ms']} ms")
     print(f"Ping {PING_TARGET}: {data['ping_result']}  "
           f"loss={data['ping_loss_pct']}%  avg={data['ping_rtt_avg_ms']} ms")
@@ -447,6 +740,10 @@ def main():
           f"{data['http_total_ms']} ms")
     print(f"Overall:        {data['overall_result']}")
     print(f"\nResult appended to: {path}")
+
+    # Keep the window open when launched by double-click as an executable
+    if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+        input("\nPress Enter to close...")
 
 
 if __name__ == "__main__":
